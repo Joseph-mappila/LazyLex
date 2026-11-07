@@ -83,23 +83,29 @@ Press `Escape` or use the close button to dismiss it.
 
 LazyLex supports native desktop shortcut integration.
 
-The shortcut depends on your desktop environment and keyboard configuration.
+The shortcut can be configured according to your desktop environment and personal preference.
 
-### Hyprland — Lua configuration
+### Hyprland Configuration
 
-LazyLex can be launched or toggled using a native Hyprland shortcut.
+Open your Hyprland configuration file:
 
-The following example uses a dedicated Copilot key that sends `Super + Shift + XF86Assistant` on the tested keyboard.
-
-Add this to your Lua keybinding configuration:
-
-```lua
-hl.bind("SUPER + SHIFT + code:201", hl.dsp.exec_cmd(
-    "uv run --directory /absolute/path/to/LazyLex lazylex --toggle"
-))
+```bash
+~/.config/hypr/hyprland.conf
 ```
 
-Replace the project path with the actual location of your LazyLex directory.
+Add a binding:
+
+```ini
+bind = SUPER SHIFT, D, exec, uv run --directory /absolute/path/to/LazyLex lazylex --toggle
+```
+
+Replace `/absolute/path/to/LazyLex` with the actual path to your LazyLex project directory.
+
+For example:
+
+```ini
+bind = SUPER SHIFT, D, exec, uv run --directory /home/user/Documents/LazyLex lazylex --toggle
+```
 
 Reload Hyprland:
 
@@ -114,9 +120,9 @@ cd /absolute/path/to/LazyLex
 uv run lazylex
 ```
 
-The Copilot key can now toggle LazyLex.
+Now press `SUPER + SHIFT + D` to toggle LazyLex.
 
-**Note:** The keycode `201` and modifier combination are specific to the tested keyboard. Other keyboards may use different keycodes or modifier combinations.
+**Note:** You can change `SUPER SHIFT, D` to any key combination supported by your Hyprland configuration.
 
 ## Development
 
