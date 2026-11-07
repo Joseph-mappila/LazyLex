@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QTextBrowser
 )
+from PyQt6.QtGui import QGuiApplication
 
 
 class Overlay(QWidget):
@@ -62,47 +63,18 @@ class Overlay(QWidget):
                 font-size: 13px;
             }
 
-            QLabel#content {
-                color: #392719;
-                font-size: 14px;
-                line-height: 150%;
-            }
-
-
             QPushButton {
                 background: transparent;
                 color: #806344;
                 border: none;
-                font-size: 21px;
-                padding: 2px 7px;
+                font-size: 16px;
+                padding: 5px 9px;
             }
 
             QPushButton:hover {
                 color: #9a352b;
                 background-color: #d9c7a2;
                 border-radius: 4px;
-            }
-
-            QScrollArea {
-                background: transparent;
-                border: none;
-            }
-
-            QScrollBar:vertical {
-                background: #ddcba7;
-                width: 6px;
-                margin: 2px;
-            }
-
-            QScrollBar::handle:vertical {
-                background: #a58a60;
-                border-radius: 3px;
-                min-height: 20px;
-            }
-
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical {
-                height: 0px;
             }
         """)
 
@@ -171,11 +143,7 @@ class Overlay(QWidget):
         self.content_label.setObjectName("content")
         self.content_label.setReadOnly(True)
         self.content_label.setOpenExternalLinks(True)
-
-        self.content_label.setFrameShape(
-            QFrame.Shape.NoFrame
-        )
-        # Scrollable definition
+        self.content_label.setFrameShape(QFrame.Shape.NoFrame)
 
         self.content_label.setStyleSheet("""
             QTextBrowser {
@@ -226,6 +194,20 @@ class Overlay(QWidget):
         self.content_label.document().setDocumentMargin(2)
 
         layout.addWidget(self.content_label)
+
+        # Copy button
+        footer_actions = QHBoxLayout()
+
+        self.copy_button = QPushButton("⧉  Copy definition")
+        self.copy_button.setToolTip("Copy the complete definition")
+        self.copy_button.clicked.connect(self.copy_definition)
+
+        footer_actions.addStretch()
+        footer_actions.addWidget(self.copy_button)
+        footer_actions.addStretch()
+
+        layout.addLayout(footer_actions)
+
         # Footer
         footer = QLabel("—  A WORD WELL WORTH KNOWING  —")
         footer.setObjectName("brand")
@@ -234,6 +216,18 @@ class Overlay(QWidget):
         layout.addWidget(footer)
 
         outer.addWidget(self.paper)
+
+    def copy_definition(self):
+        """Copy the displayed definition to the clipboard."""
+
+        text = self.content_label.toPlainText().strip()
+
+        if not text:
+            return
+
+        QGuiApplication.clipboard().setText(text)
+
+        self.copy_button.setText("✓  Copied!")
 
     def show_loading(self, term):
         """Show the lookup loading state."""
@@ -245,6 +239,8 @@ class Overlay(QWidget):
             'Consulting the old lexicon...</p>'
         )
 
+        self.copy_button.setText("⧉  Copy definition")
+
         self.adjustSize()
         self.show_bottom_right()
 
@@ -253,6 +249,8 @@ class Overlay(QWidget):
 
         self.word_label.setText(term[:60])
         self.content_label.setText(result)
+
+        self.copy_button.setText("⧉  Copy definition")
 
         self.adjustSize()
         self.show_bottom_right()
