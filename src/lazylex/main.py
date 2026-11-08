@@ -1,8 +1,10 @@
 
 """LazyLex application entry point."""
+
 import signal
 import argparse
 import sys
+import os
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
@@ -28,7 +30,7 @@ class Signals(QObject):
 class LookupWorker(QThread):
     """Run API lookups in a background thread."""
 
-    finished_lookup = pyqtSignal(str, str)
+    finished_lookup = pyqtSignal(str, object)
 
     def __init__(self, term):
         super().__init__()
@@ -50,7 +52,13 @@ class LazyLexApp:
         self.signals = Signals()
         self.signals.hotkey.connect(self.toggle_lookup)
 
-        self.worker = None
+        # Connect the search field to the same lookup system.
+        self.overlay.search_requested.connect(
+            self.search_lookup
+        )
+
+        self.workers = []
+        self.lookup_id = 0
         self.listener = None
 
         self.server = QLocalServer(app)
@@ -70,9 +78,20 @@ class LazyLexApp:
     def start_hotkey_listener(self):
         """Register global hotkeys where supported."""
 
+        # Wayland does not reliably support global pynput shortcuts.
+        is_wayland = (
+            os.environ.get("XDG_SESSION_TYPE") == "wayland"
+            or "WAYLAND_DISPLAY" in os.environ
+        )
+
+        if is_wayland:
+            print("Wayland detected.")
+            print("Configure LazyLex using your desktop's native shortcut.")
+            return
+
+        # Use portable shortcuts on platforms supported by pynput.
         hotkeys = {
             "<ctrl>+<alt>+d": self.request_toggle,
-            "<super>+<shift>+d": self.request_toggle,
         }
 
         try:
@@ -84,7 +103,7 @@ class LazyLexApp:
 
         except Exception as error:
             print("Global hotkey unavailable:", error)
-            print("Use the native desktop shortcut.")
+            print("Configure a native desktop shortcut instead.")
 
     def request_toggle(self):
         """Send a toggle signal to the Qt main thread."""
@@ -123,64 +142,85 @@ class LazyLexApp:
         socket.disconnectFromServer()
 
     def toggle_lookup(self):
-        """Capture text and show the definition."""
-
-        if self.overlay.isVisible():
-            self.overlay.hide()
-            return
+        """Capture the current selection and update the overlay."""
 
         selected_text = get_selected_text()
 
         if not selected_text:
+            # Invalidate any older lookup still running.
+            self.lookup_id += 1
 
-            self.overlay.word_label.setText("LazyLex")
-
-            self.overlay.content_label.setText(
-                '<p style="color:#f38ba8;">'
-                'No text selected. '
-                'Please select a word and try again.'
-                '</p>'
-            )
-
-            self.overlay.adjustSize()
-            self.overlay.show_bottom_right()
+            self.overlay.show_no_selection()
             return
 
-        self.overlay.show_loading(selected_text)
+        self.start_lookup(selected_text)
 
-        if self.worker is not None:
-            if self.worker.isRunning():
-                self.overlay.content_label.setText(
-                    "Another lookup is already running."
+    """def search_lookup(self, term):
+        Start a lookup for text entered manually.
+
+        term = term.strip()
+
+        if not term:
+            return
+
+        self.start_lookup(term)"""
+    def search_lookup(self, term):
+        """Start a lookup for text entered manually."""
+
+        print("MAIN RECEIVED SEARCH:", repr(term))
+
+        term = term.strip()
+
+        if not term:
+            return
+
+        self.start_lookup(term)
+
+    def start_lookup(self, term):
+        """Start a background lookup for the given term."""
+
+        # Give this lookup a unique ID.
+        self.lookup_id += 1
+        current_id = self.lookup_id
+
+        # Immediately update the existing popup.
+        self.overlay.show_loading(term)
+
+        # Start a new lookup, even if an older one is running.
+        worker = LookupWorker(term)
+        self.workers.append(worker)
+
+        worker.finished_lookup.connect(
+            lambda result_term, result, lookup_id=current_id:
+                self.on_lookup_finished(
+                    lookup_id,
+                    result_term,
+                    result
                 )
-                return
-
-        self.worker = LookupWorker(selected_text)
-
-        self.worker.finished_lookup.connect(
-            self.on_lookup_finished
         )
 
-        self.worker.finished.connect(
-            self.on_worker_finished
+        worker.finished.connect(
+            lambda w=worker: self.on_worker_finished(w)
         )
 
-        self.worker.start()
+        worker.start()
 
-    def on_lookup_finished(self, term, result):
-        """Display the lookup result."""
+    def on_lookup_finished(self, lookup_id, term, result):
+        """Display only the result of the latest lookup."""
+
+        if lookup_id != self.lookup_id:
+            return
 
         if self.overlay.isVisible():
             self.overlay.show_result(term, result)
 
-    def on_worker_finished(self):
-        """Clean up the finished background thread."""
+    def on_worker_finished(self, worker):
+        """Clean up a completed lookup thread."""
 
-        worker = self.worker
+        if worker in self.workers:
+            self.workers.remove(worker)
 
-        if worker is not None:
-            self.worker = None
-            worker.deleteLater()
+        worker.deleteLater()
 
     def stop(self):
         """Clean up application resources."""
@@ -189,9 +229,12 @@ class LazyLexApp:
             self.listener.stop()
             self.listener.join(timeout=1)
 
-        if self.worker is not None:
-            self.worker.wait(12000)
+        for worker in self.workers:
+            worker.wait(12000)
 
+        self.workers.clear()
+
+        self.overlay.stop_pronunciation()
         self.overlay.hide()
         self.server.close()
 
@@ -244,6 +287,7 @@ def main():
     app._interrupt_timer = QTimer()
     app._interrupt_timer.timeout.connect(lambda: None)
     app._interrupt_timer.start(200)
+
     # Used by the Hyprland shortcut.
     if args.toggle:
 

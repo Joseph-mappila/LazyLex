@@ -82,11 +82,15 @@ def copy_selection_wayland():
     )
 
     if result is None:
-        return old_clipboard
+        return None
 
     time.sleep(0.25)
 
     selected_text = get_wayland_clipboard()
+
+    # No new selection was copied.
+    if not selected_text or selected_text == old_clipboard:
+        return None
 
     # Restore the user's previous clipboard.
     if old_clipboard is not None:
@@ -96,8 +100,7 @@ def copy_selection_wayland():
             timeout=3,
         )
 
-    return selected_text
-
+    return selected_text[:MAX_SELECTION_LENGTH]
 
 def simulate_copy():
     """Fallback copy method for other desktop environments."""
