@@ -4,6 +4,7 @@
 import os
 import subprocess
 import tempfile
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -28,60 +29,171 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QTextBrowser,
     QLineEdit,
+    QCheckBox,
 )
 
 
-def cleanup_old_audio_files():
-    """Remove leftover LazyLex audio files from previous sessions."""
+AUDIO_TEMP_DIR = os.path.join(
+    tempfile.gettempdir(),
+    "lazylex",
+)
 
-    temp_dir = tempfile.gettempdir()
+
+def get_audio_temp_dir():
+    """Create a private directory for LazyLex audio files."""
+
+    os.makedirs(AUDIO_TEMP_DIR, mode=0o700, exist_ok=True)
+
+    if os.name == "posix":
+        os.chmod(AUDIO_TEMP_DIR, 0o700)
+
+    return AUDIO_TEMP_DIR
+
+
+def cleanup_old_audio_files():
+    """Remove leftover LazyLex audio files from its private directory."""
+
+    temp_dir = get_audio_temp_dir()
 
     for filename in os.listdir(temp_dir):
-        if filename.startswith("lazylex-") and filename.endswith(".mp3"):
+        if (
+            filename.startswith("lazylex-")
+            and filename.endswith(".mp3")
+        ):
             file_path = os.path.join(temp_dir, filename)
 
             try:
-                os.remove(file_path)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
             except OSError:
                 pass
 
-
 class AudioDownloadWorker(QThread):
-    """Download and normalize pronunciation audio."""
+    """Download and normalize pronunciation audio safely."""
 
     downloaded = pyqtSignal(str, str)
+
+    MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10 MB
 
     def __init__(self, url):
         super().__init__()
         self.url = url
+
+    def validate_audio_url(self):
+        """Only allow HTTPS audio URLs from the dictionary API."""
+
+        parsed = urlsplit(self.url)
+
+        hostname = (parsed.hostname or "").lower()
+
+        if parsed.scheme != "https":
+            raise ValueError("Audio URL must use HTTPS.")
+
+        if (
+            hostname != "dictionaryapi.dev"
+            and not hostname.endswith(".dictionaryapi.dev")
+        ):
+            raise ValueError("Untrusted audio download source.")
+
+        if parsed.username or parsed.password:
+            raise ValueError("Invalid audio URL.")
+
+        if parsed.port not in (None, 443):
+            raise ValueError("Invalid audio URL port.")
+
+        return self.url
+
+    def download_audio(self, destination):
+        """Download audio with a strict size limit."""
+
+        url = self.validate_audio_url()
+
+        total_size = 0
+
+        with httpx.Client(
+            timeout=20.0,
+            follow_redirects=False,
+            headers={"User-Agent": "LazyLex/0.1"},
+        ) as client:
+
+            with client.stream("GET", url) as response:
+
+                response.raise_for_status()
+
+                content_type = response.headers.get(
+                    "content-type", ""
+                ).split(";")[0].strip().lower()
+
+                if not (
+                    content_type.startswith("audio/")
+                    or content_type == "application/octet-stream"
+                ):
+                    raise ValueError(
+                        "The server did not return an audio file."
+                    )
+
+                content_length = response.headers.get(
+                    "content-length"
+                )
+
+                if content_length:
+                    try:
+                        if int(content_length) > self.MAX_AUDIO_SIZE:
+                            raise ValueError(
+                                "Audio file exceeds the 10 MB limit."
+                            )
+                    except ValueError as error:
+                        if "10 MB" in str(error):
+                            raise
+                        raise ValueError(
+                            "Invalid audio file size."
+                        )
+
+                with open(destination, "wb") as audio_file:
+
+                    for chunk in response.iter_bytes(
+                        chunk_size=64 * 1024
+                    ):
+                        if not chunk:
+                            continue
+
+                        total_size += len(chunk)
+
+                        if total_size > self.MAX_AUDIO_SIZE:
+                            raise ValueError(
+                                "Audio file exceeds the 10 MB limit."
+                            )
+
+                        audio_file.write(chunk)
+
+        if total_size == 0:
+            raise ValueError(
+                "The audio server returned an empty file."
+            )
 
     def run(self):
         source_path = ""
         output_path = ""
 
         try:
-            response = httpx.get(
-                self.url,
-                timeout=20.0,
-                follow_redirects=True,
-                headers={"User-Agent": "LazyLex/0.1"},
-            )
-            response.raise_for_status()
+            temp_dir = get_audio_temp_dir()
 
-            if not response.content:
-                raise ValueError("The audio server returned an empty file.")
-
+            # Downloaded source audio.
             with tempfile.NamedTemporaryFile(
                 prefix="lazylex-source-",
                 suffix=".mp3",
+                dir=temp_dir,
                 delete=False,
             ) as audio_file:
                 source_path = audio_file.name
-                audio_file.write(response.content)
 
+            self.download_audio(source_path)
+
+            # Normalized output audio.
             with tempfile.NamedTemporaryFile(
                 prefix="lazylex-",
                 suffix=".mp3",
+                dir=temp_dir,
                 delete=False,
             ) as audio_file:
                 output_path = audio_file.name
@@ -96,7 +208,7 @@ class AudioDownloadWorker(QThread):
                         "-y",
                         "-i", source_path,
                         "-af",
-                        "dynaudnorm=f=150:g=15:p=0.9,volume=2.0,alimiter=limit=0.95",
+                        "loudnorm=I=-14:TP=-1.0:LRA=7,alimiter=limit=0.95",
                         "-codec:a", "libmp3lame",
                         "-q:a", "2",
                         output_path,
@@ -108,7 +220,9 @@ class AudioDownloadWorker(QThread):
                 )
 
                 if os.path.getsize(output_path) == 0:
-                    raise RuntimeError("FFmpeg produced an empty audio file.")
+                    raise RuntimeError(
+                        "FFmpeg produced an empty audio file."
+                    )
 
                 os.remove(source_path)
                 source_path = ""
@@ -139,7 +253,6 @@ class AudioDownloadWorker(QThread):
                         os.remove(path)
                     except OSError:
                         pass
-
 
 class Overlay(QWidget):
     """Floating antique-style dictionary window."""
@@ -176,6 +289,9 @@ class Overlay(QWidget):
         self.audio_url = None
         self.audio_worker = None
         self.audio_file = None
+
+        # Background audio control.
+        self.muted_sink_inputs = {}
 
         self.player.mediaStatusChanged.connect(
             self.handle_media_status
@@ -300,6 +416,7 @@ class Overlay(QWidget):
         # Search field.
         self.search_input = QLineEdit()
         self.search_input.setObjectName("search")
+        self.search_input.setMaxLength(200)
         self.search_input.setPlaceholderText(
             "Search any word or phrase..."
         )
@@ -313,6 +430,7 @@ class Overlay(QWidget):
         # Word heading.
         self.word_label = QLabel("LazyLex")
         self.word_label.setObjectName("word")
+        self.word_label.setTextFormat(Qt.TextFormat.PlainText)
         self.word_label.setWordWrap(True)
 
         layout.addWidget(self.word_label)
@@ -322,6 +440,7 @@ class Overlay(QWidget):
 
         self.phonetic_label = QLabel("")
         self.phonetic_label.setObjectName("phonetic")
+        self.phonetic_label.setTextFormat(Qt.TextFormat.PlainText)
 
         self.audio_button = QPushButton("🔊  Listen")
         self.audio_button.setToolTip("Play pronunciation")
@@ -357,7 +476,7 @@ class Overlay(QWidget):
                 border: none;
                 color: #302317;
                 font-family: Georgia, 'Times New Roman', serif;
-                font-size: 15px;
+                font-size: 16px;
                 selection-background-color: #a58a60;
                 selection-color: #fff8e8;
             }
@@ -395,8 +514,8 @@ class Overlay(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
 
-        self.content_label.setMinimumHeight(100)
-        self.content_label.setMaximumHeight(290)
+        self.content_label.setMinimumHeight(120)
+        self.content_label.setMaximumHeight(320)
 
         self.content_label.document().setDocumentMargin(2)
 
@@ -418,6 +537,31 @@ class Overlay(QWidget):
         footer_actions.addStretch()
 
         layout.addLayout(footer_actions)
+        # Background audio muting option.
+        self.duck_audio_checkbox = QCheckBox(
+            "Mute other apps during pronunciation"
+        )
+
+        self.duck_audio_checkbox.setChecked(True)
+
+        self.duck_audio_checkbox.setToolTip(
+            "Temporarily mute other applications while LazyLex speaks."
+        )
+
+        self.duck_audio_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #70583e;
+                font-size: 12px;
+                spacing: 7px;
+            }
+
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+            }
+        """)
+
+        layout.addWidget(self.duck_audio_checkbox)
 
         # Footer.
         footer = QLabel("—  A WORD WELL WORTH KNOWING  —")
@@ -428,27 +572,14 @@ class Overlay(QWidget):
 
         outer.addWidget(self.paper)
 
-    """def submit_search(self):
-        Submit the text entered in the search field."
-
-        term = self.search_input.text().strip()
-
-        if not term:
-            return
-
-        self.search_requested.emit(term)"""
     def submit_search(self):
         """Submit the text entered in the search field."""
 
         term = self.search_input.text().strip()
 
-        print("SEARCH BUTTON ENTERED:", repr(term))
-
         if not term:
-            print("Search field is empty.")
             return
 
-        print("Emitting search request...")
         self.search_requested.emit(term)
 
     def copy_definition(self):
@@ -461,6 +592,95 @@ class Overlay(QWidget):
 
         QGuiApplication.clipboard().setText(text)
         self.copy_button.setText("✓  Copied!")
+
+    def mute_background_audio(self):
+        """Mute other application audio streams temporarily."""
+
+        if not self.duck_audio_checkbox.isChecked():
+            return
+
+        try:
+            result = subprocess.run(
+                ["pactl", "-f", "json", "list", "sink-inputs"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=True,
+            )
+
+            import json
+
+            sink_inputs = json.loads(result.stdout)
+
+            for stream in sink_inputs:
+                properties = stream.get("properties", {})
+
+                process_id = properties.get(
+                    "application.process.id"
+                )
+
+                application_name = properties.get(
+                    "application.name", ""
+                )
+
+                # Never mute LazyLex itself.
+                if (
+                    str(process_id) == str(os.getpid())
+                    or "lazylex" in application_name.lower()
+                ):
+                    continue
+
+                stream_id = stream.get("index")
+
+                if stream_id is None:
+                    continue
+
+                # Remember the original mute state.
+                original_mute = bool(stream.get("mute", False))
+
+                self.muted_sink_inputs[stream_id] = original_mute
+
+                subprocess.run(
+                    [
+                        "pactl",
+                        "set-sink-input-mute",
+                        str(stream_id),
+                        "1",
+                    ],
+                    capture_output=True,
+                    timeout=3,
+                    check=True,
+                )
+
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            print("Could not mute background audio:", error)
+
+            self.restore_background_audio()
+
+
+    def restore_background_audio(self):
+        """Restore the original mute state of other applications."""
+
+        for stream_id, original_mute in self.muted_sink_inputs.items():
+
+            try:
+                subprocess.run(
+                    [
+                        "pactl",
+                        "set-sink-input-mute",
+                        str(stream_id),
+                        "1" if original_mute else "0",
+                    ],
+                    capture_output=True,
+                    timeout=3,
+                    check=True,
+                )
+
+            except (OSError, subprocess.SubprocessError):
+                # The application may have closed during playback.
+                pass
+
+        self.muted_sink_inputs.clear()
 
     def play_pronunciation(self):
         """Download and play the pronunciation."""
@@ -519,12 +739,16 @@ class Overlay(QWidget):
             QUrl.fromLocalFile(self.audio_file)
         )
 
+        # Temporarily mute other applications.
+        self.mute_background_audio()
+
         self.player.play()
 
     def handle_media_status(self, status):
         """Clean up audio after playback finishes."""
 
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.restore_background_audio()
             self.cleanup_audio_file()
 
     def handle_audio_error(self, error, error_string):
@@ -535,6 +759,7 @@ class Overlay(QWidget):
 
         print("Pronunciation playback error:", error_string)
 
+        self.restore_background_audio()
         self.cleanup_audio_file()
 
         self.phonetic_label.setText(
@@ -553,9 +778,11 @@ class Overlay(QWidget):
         self.audio_file = None
 
     def stop_pronunciation(self):
-        """Stop playback and remove temporary audio."""
+        """Stop playback and restore background audio."""
 
         self.player.stop()
+
+        self.restore_background_audio()
         self.cleanup_audio_file()
 
     def show_no_selection(self):

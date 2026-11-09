@@ -11,7 +11,7 @@ import pyperclip
 from pynput.keyboard import Controller, Key
 
 
-MAX_SELECTION_LENGTH = 20000
+MAX_SELECTION_LENGTH = 200
 
 
 def is_wayland():
@@ -65,42 +65,53 @@ def get_wayland_clipboard():
     return text[:MAX_SELECTION_LENGTH].strip() if text else None
 
 
-def copy_selection_wayland():
-    """Copy highlighted text using the Wayland virtual keyboard."""
+def restore_wayland_clipboard(old_clipboard):
+    """Restore the previous Wayland clipboard contents."""
 
-    if not shutil.which("wtype"):
-        return None
-
-    if not shutil.which("wl-copy"):
-        return None
-
-    old_clipboard = get_wayland_clipboard()
-
-    # Simulate Ctrl+C in the currently focused application.
-    result = run_command(
-        ["wtype", "-M", "ctrl", "c", "-m", "ctrl"]
-    )
-
-    if result is None:
-        return None
-
-    time.sleep(0.25)
-
-    selected_text = get_wayland_clipboard()
-
-    # No new selection was copied.
-    if not selected_text or selected_text == old_clipboard:
-        return None
-
-    # Restore the user's previous clipboard.
-    if old_clipboard is not None:
+    if old_clipboard is None:
+        run_command(["wl-copy", "--clear"], timeout=3)
+    else:
         run_command(
             ["wl-copy", "--type", "text/plain"],
             input_text=old_clipboard,
             timeout=3,
         )
 
-    return selected_text[:MAX_SELECTION_LENGTH]
+
+def copy_selection_wayland():
+    """Copy highlighted text using the Wayland virtual keyboard."""
+
+    if not shutil.which("wtype") or not shutil.which("wl-copy"):
+        return None
+
+    # Save the clipboard before simulating Ctrl+C.
+    old_clipboard = run_command(
+        ["wl-paste", "--no-newline"]
+    )
+
+    try:
+        result = run_command(
+            ["wtype", "-M", "ctrl", "c", "-m", "ctrl"]
+        )
+
+        if result is None:
+            return None
+
+        time.sleep(0.25)
+
+        selected_text = run_command(
+            ["wl-paste", "--no-newline"]
+        )
+
+        if not selected_text or selected_text == old_clipboard:
+            return None
+
+        return selected_text[:MAX_SELECTION_LENGTH].strip() or None
+
+    finally:
+        # Restore the original clipboard, even if copying fails.
+        restore_wayland_clipboard(old_clipboard)
+
 
 def simulate_copy():
     """Fallback copy method for other desktop environments."""
@@ -110,7 +121,10 @@ def simulate_copy():
     try:
         old_clipboard = pyperclip.paste()
     except pyperclip.PyperclipException:
-        old_clipboard = None
+        # Do not modify the clipboard if we cannot save it.
+        return None
+
+    copied_text = None
 
     try:
         pyperclip.copy("")
@@ -129,18 +143,18 @@ def simulate_copy():
 
         copied_text = pyperclip.paste().strip()
 
-        if copied_text:
-            return copied_text[:MAX_SELECTION_LENGTH]
-
-        if old_clipboard is not None:
-            pyperclip.copy(old_clipboard)
-
     except Exception:
-        if old_clipboard is not None:
-            try:
-                pyperclip.copy(old_clipboard)
-            except Exception:
-                pass
+        copied_text = None
+
+    finally:
+        # Always attempt to restore the previous clipboard.
+        try:
+            pyperclip.copy(old_clipboard)
+        except Exception:
+            pass
+
+    if copied_text:
+        return copied_text[:MAX_SELECTION_LENGTH]
 
     return None
 
@@ -157,12 +171,7 @@ def get_selected_text():
             return text
 
         # Otherwise simulate Ctrl+C through Wayland.
-        text = copy_selection_wayland()
-
-        if text:
-            return text
-
-        return None
+        return copy_selection_wayland()
 
     # Other platforms.
     return simulate_copy()

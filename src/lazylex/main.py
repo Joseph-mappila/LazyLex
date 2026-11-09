@@ -19,6 +19,7 @@ from lazylex.lookup import lookup
 
 
 SERVER_NAME = "LazyLex-Desktop-Companion"
+MAX_COMMAND_SIZE = 32
 
 
 class Signals(QObject):
@@ -52,7 +53,6 @@ class LazyLexApp:
         self.signals = Signals()
         self.signals.hotkey.connect(self.toggle_lookup)
 
-        # Connect the search field to the same lookup system.
         self.overlay.search_requested.connect(
             self.search_lookup
         )
@@ -62,6 +62,11 @@ class LazyLexApp:
         self.listener = None
 
         self.server = QLocalServer(app)
+
+        # Restrict access to the current user.
+        self.server.setSocketOptions(
+            QLocalServer.SocketOption.UserAccessOption
+        )
 
         # Remove a stale socket from a previous crash.
         QLocalServer.removeServer(SERVER_NAME)
@@ -78,7 +83,6 @@ class LazyLexApp:
     def start_hotkey_listener(self):
         """Register global hotkeys where supported."""
 
-        # Wayland does not reliably support global pynput shortcuts.
         is_wayland = (
             os.environ.get("XDG_SESSION_TYPE") == "wayland"
             or "WAYLAND_DISPLAY" in os.environ
@@ -86,10 +90,11 @@ class LazyLexApp:
 
         if is_wayland:
             print("Wayland detected.")
-            print("Configure LazyLex using your desktop's native shortcut.")
+            print(
+                "Configure LazyLex using your desktop's native shortcut."
+            )
             return
 
-        # Use portable shortcuts on platforms supported by pynput.
         hotkeys = {
             "<ctrl>+<alt>+d": self.request_toggle,
         }
@@ -120,6 +125,8 @@ class LazyLexApp:
             if socket is None:
                 continue
 
+            socket.setProperty("command_buffer", b"")
+
             socket.readyRead.connect(
                 lambda s=socket: self.read_command(s)
             )
@@ -129,14 +136,29 @@ class LazyLexApp:
             )
 
     def read_command(self, socket):
-        """Read a local toggle command."""
+        """Read and validate a local IPC command."""
 
-        command = bytes(socket.readAll()).decode(
-            "utf-8",
-            errors="replace"
-        ).strip()
+        previous_data = socket.property("command_buffer")
 
-        if command == "toggle":
+        if not isinstance(previous_data, bytes):
+            previous_data = b""
+
+        incoming_data = bytes(socket.readAll())
+
+        command_data = previous_data + incoming_data
+
+        # Reject oversized messages.
+        if len(command_data) > MAX_COMMAND_SIZE:
+            socket.disconnectFromServer()
+            return
+
+        # Wait for the complete newline-terminated message.
+        if b"\n" not in command_data:
+            socket.setProperty("command_buffer", command_data)
+            return
+
+        # Accept exactly one command.
+        if command_data == b"toggle\n":
             self.request_toggle()
 
         socket.disconnectFromServer()
@@ -147,27 +169,14 @@ class LazyLexApp:
         selected_text = get_selected_text()
 
         if not selected_text:
-            # Invalidate any older lookup still running.
             self.lookup_id += 1
-
             self.overlay.show_no_selection()
             return
 
         self.start_lookup(selected_text)
 
-    """def search_lookup(self, term):
-        Start a lookup for text entered manually.
-
-        term = term.strip()
-
-        if not term:
-            return
-
-        self.start_lookup(term)"""
     def search_lookup(self, term):
         """Start a lookup for text entered manually."""
-
-        print("MAIN RECEIVED SEARCH:", repr(term))
 
         term = term.strip()
 
@@ -179,14 +188,11 @@ class LazyLexApp:
     def start_lookup(self, term):
         """Start a background lookup for the given term."""
 
-        # Give this lookup a unique ID.
         self.lookup_id += 1
         current_id = self.lookup_id
 
-        # Immediately update the existing popup.
         self.overlay.show_loading(term)
 
-        # Start a new lookup, even if an older one is running.
         worker = LookupWorker(term)
         self.workers.append(worker)
 
@@ -249,9 +255,16 @@ def send_toggle_command():
     if not socket.waitForConnected(1000):
         return False
 
-    socket.write(b"toggle")
-    socket.flush()
-    socket.waitForBytesWritten(1000)
+    message = b"toggle\n"
+
+    if socket.write(message) != len(message):
+        socket.disconnectFromServer()
+        return False
+
+    if not socket.waitForBytesWritten(1000):
+        socket.disconnectFromServer()
+        return False
+
     socket.disconnectFromServer()
 
     return True
@@ -277,18 +290,15 @@ def main():
     app.setApplicationName(__app_name__)
     app.setQuitOnLastWindowClosed(False)
 
-    # Handle Ctrl+C from the terminal.
     signal.signal(
         signal.SIGINT,
         lambda signum, frame: app.quit()
     )
 
-    # Allow Python to process interrupts while Qt is running.
     app._interrupt_timer = QTimer()
     app._interrupt_timer.timeout.connect(lambda: None)
     app._interrupt_timer.start(200)
 
-    # Used by the Hyprland shortcut.
     if args.toggle:
 
         if send_toggle_command():

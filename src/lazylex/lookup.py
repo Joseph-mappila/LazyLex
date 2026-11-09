@@ -22,6 +22,7 @@ WIKIPEDIA_SEARCH_URL = (
 )
 
 TIMEOUT = 15.0
+MAX_LOOKUP_LENGTH = 200
 
 
 def escape_text(text):
@@ -142,7 +143,10 @@ def format_wikipedia(data):
         )
 
     result = (
-        f'<p style="color:#302317; font-size:15px;">'
+        f'<p style="color:#302317; '
+        f'font-size:16px; '
+        f'line-height:150%; '
+        f'margin-bottom:14px;">'
         f'{escape_text(extract[:1500])}</p>'
     )
 
@@ -204,7 +208,7 @@ async def dictionary_lookup(client, word):
 
 
 async def wikipedia_search(client, term):
-    """Search Wikipedia for relevant article titles."""
+    """Search Wikipedia and return article titles and snippets."""
 
     response = await client.get(
         WIKIPEDIA_SEARCH_URL,
@@ -223,12 +227,73 @@ async def wikipedia_search(client, term):
     data = response.json()
 
     return [
-        item.get("title", "")
+        {
+            "title": item.get("title", ""),
+            "snippet": item.get("snippet", ""),
+        }
         for item in data.get("query", {}).get("search", [])
         if item.get("title")
     ]
 
+def normalize_search_words(text):
+    """Normalize text into comparable search words."""
 
+    text = html.unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.lower()
+
+    words = re.findall(r"\b[a-z0-9]+\b", text)
+
+    # Handle common plural forms.
+    return {
+        word[:-1] if word.endswith("s") and len(word) > 4 else word
+        for word in words
+    }
+
+
+def get_wikipedia_search_terms(topic):
+    """Generate useful alternative searches for a topic."""
+
+    search_terms = [topic]
+
+    normalized = topic.lower()
+
+    # GitHub workflows are implemented using GitHub Actions.
+    if re.search(r"\bgithub\s+workflows?\b", normalized):
+        search_terms.insert(0, "GitHub Actions workflows")
+
+    # Search the exact phrase as well.
+    search_terms.append(f'"{topic}"')
+
+    return list(dict.fromkeys(search_terms))
+
+
+def score_wikipedia_article(title, snippet, extract, topic):
+    """Score relevance using the actual article, not search snippets."""
+
+    topic_words = normalize_search_words(topic)
+
+    title_words = normalize_search_words(title)
+    summary_words = normalize_search_words(extract)
+
+    article_words = title_words | summary_words
+
+    if not topic_words:
+        return 0
+
+    # Every important topic word must appear in the
+    # article title or its actual summary.
+    if not topic_words.issubset(article_words):
+        return 0
+
+    title_matches = len(topic_words & title_words)
+    summary_matches = len(topic_words & summary_words)
+
+    return (
+        title_matches * 30
+        + summary_matches * 20
+        + len(topic_words) * 10
+    )
 
 async def wikipedia_summary(client, title):
     """Retrieve a Wikipedia article summary using the Action API."""
@@ -362,42 +427,182 @@ async def find_spelling_suggestion(client, word):
 
     return None
 
+def extract_search_topic(term):
+    """Remove common question phrases and extract the main topic."""
 
+    topic = re.sub(r"\s+", " ", term).strip()
+    topic = topic.rstrip("?.!, ")
+
+    prefixes = [
+        r"^(?:what is|what are|who is|who are)\s+",
+        r"^(?:what does|what do)\s+",
+        r"^(?:how does|how do|how is|how are)\s+",
+        r"^(?:why does|why do|why is|why are)\s+",
+        r"^(?:explain|define|describe)\s+",
+        r"^(?:tell me about)\s+",
+        r"^(?:meaning of)\s+",
+    ]
+
+    for pattern in prefixes:
+        topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
+        if topic != term:
+            break
+
+    # Remove an article left after removing the question phrase.
+    topic = re.sub(r"^(?:a|an|the)\s+", "", topic, flags=re.IGNORECASE)
+
+    # Handle questions such as "how does garbage collection work?"
+    topic = re.sub(r"\s+work$", "", topic, flags=re.IGNORECASE)
+
+    return topic.strip()
+
+
+def normalize_title(title):
+    """Normalize a Wikipedia title for comparison."""
+
+    title = title.lower()
+    title = re.sub(r"\([^)]*\)", "", title)
+    title = re.sub(r"[^a-z0-9]+", " ", title)
+
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def score_wikipedia_title(title, topic):
+    """Score how closely a Wikipedia title matches the search topic."""
+
+    normalized_title = normalize_title(title)
+    normalized_topic = normalize_title(topic)
+
+    if not normalized_title or not normalized_topic:
+        return 0
+
+    if normalized_title == normalized_topic:
+        return 1000
+
+    title_words = set(normalized_title.split())
+    topic_words = set(normalized_topic.split())
+
+    common_words = title_words & topic_words
+
+    if not common_words:
+        return 0
+
+    coverage = len(common_words) / len(topic_words)
+
+    # Prefer informative titles over overly broad one-word titles.
+    specificity_bonus = min(len(title_words), len(topic_words)) * 8
+
+    missing_words_penalty = (
+        len(topic_words - title_words) * 20
+    )
+
+    return (
+        coverage * 100
+        + specificity_bonus
+        - missing_words_penalty
+    )
 
 async def wikipedia_lookup(client, term):
-    """Search Wikipedia and retrieve the best available summary."""
+    """Search Wikipedia and select a genuinely relevant article."""
 
     try:
-        # Give the programming-language article priority
-        # when the user searches for Python.
-        search_terms = [term]
+        topic = extract_search_topic(term)
 
-        if term.lower() == "python":
-            search_terms.insert(
-                0,
-                "Python programming language",
+        if not topic:
+            topic = term
+
+        search_terms = get_wikipedia_search_terms(topic)
+        # GitHub workflows are created and managed using GitHub Actions.
+        if re.search(r"\bgithub\s+workflows?\b", topic, re.IGNORECASE):
+
+            result = await wikipedia_summary(
+                client,
+                "GitHub Actions",
             )
+
+            if result:
+                return result
+
+        best_result = None
+        best_score = 0
+
+        searched_titles = set()
 
         for search_term in search_terms:
 
-            titles = await wikipedia_search(
+            articles = await wikipedia_search(
                 client,
                 search_term,
             )
 
-            for title in titles:
+            for article in articles:
 
-                result = await wikipedia_summary(
-                    client,
-                    title,
+                title = article["title"]
+
+                if title.lower() in searched_titles:
+                    continue
+
+                searched_titles.add(title.lower())
+
+                # Retrieve the article's actual summary.
+                response = await client.get(
+                    WIKIPEDIA_SEARCH_URL,
+                    params={
+                        "action": "query",
+                        "prop": "extracts|info",
+                        "exintro": 1,
+                        "explaintext": 1,
+                        "inprop": "url",
+                        "redirects": 1,
+                        "titles": title,
+                        "format": "json",
+                        "formatversion": 2,
+                    },
                 )
 
-                if result:
-                    return result
+                response.raise_for_status()
+
+                data = response.json()
+                pages = data.get("query", {}).get("pages", [])
+
+                if not pages:
+                    continue
+
+                page = pages[0]
+                extract = page.get("extract", "")
+
+                if not extract:
+                    continue
+
+                score = score_wikipedia_article(
+                    page.get("title", title),
+                    article.get("snippet", ""),
+                    extract,
+                    topic,
+                )
+
+                if score > best_score:
+
+                    best_score = score
+
+                    best_result = make_result(
+                        format_wikipedia({
+                            "extract": extract,
+                            "content_urls": {
+                                "desktop": {
+                                    "page": page.get("fullurl", "")
+                                }
+                            },
+                        })
+                    )
+
+        if best_result:
+            return best_result
 
         return make_result(
             '<p style="color:#913D32;">'
-            'No matching Wikipedia article or summary was found.'
+            'No closely matching Wikipedia article was found. '
+            'Try a more specific search phrase.'
             '</p>'
         )
 
@@ -430,8 +635,7 @@ async def wikipedia_lookup(client, term):
             'Could not process the Wikipedia response.'
             '</p>'
         )
-
-
+        
 async def lookup_async(term):
     """Perform dictionary, spelling correction, and Wikipedia lookup."""
 
@@ -440,6 +644,14 @@ async def lookup_async(term):
     if not term:
         return make_result(
             "<p>No text selected.</p>"
+        )
+
+    if len(term) > MAX_LOOKUP_LENGTH:
+        return make_result(
+            '<p style="color:#913D32;">'
+            'Your search is too long. '
+            'Please use 200 characters or fewer.'
+            '</p>'
         )
 
     async with httpx.AsyncClient(
